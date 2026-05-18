@@ -1,11 +1,13 @@
 import React, { useEffect, useRef } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { receiveIncomingCall, acceptCall, endCall, resetCallState, setLocalStream, setRemoteStream } from '../features/callSlice';
-import { socket } from '../socket'; // <-- Updated import
+import { receiveIncomingCall, acceptCall, endCall, resetCallState } from '../features/callSlice';
+import { socket } from '../socket';
 
-// Global WebRTC connection object
+// Global WebRTC connection objects out of Redux/React Scope
 let peerConnection;
-let pendingIceCandidates = []; // Queue for buffering ICE candidates
+let pendingIceCandidates = []; 
+let isRemoteDescriptionSet = false;
+let globalLocalStream = null;
 
 const configuration = {
   iceServers: [
@@ -13,7 +15,10 @@ const configuration = {
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:global.stun.twilio.com:3478' },
     {
-      urls: 'turn:187.77.9.39:3478',
+      urls: [
+        'turn:187.77.9.39:3478?transport=udp',
+        'turn:187.77.9.39:3478?transport=tcp' // Extremely important fallback for deep NATs
+      ],
       username: 'myuser',
       credential: 'mypassword'
     }
@@ -23,25 +28,11 @@ const configuration = {
 const CallModal = () => {
   const dispatch = useDispatch();
   const { user } = useSelector((state) => state.auth);
-  const { isCalling, incomingCall, callStatus, localStream, remoteStream } = useSelector((state) => state.call);
+  const { isCalling, incomingCall, callStatus } = useSelector((state) => state.call);
 
   const localAudioRef = useRef(null);
   const remoteAudioRef = useRef(null);
 
-  // Bind streams to audio elements when they change
-  useEffect(() => {
-    if (localAudioRef.current && localStream) {
-      localAudioRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
-
-  useEffect(() => {
-    if (remoteAudioRef.current && remoteStream) {
-      remoteAudioRef.current.srcObject = remoteStream;
-    }
-  }, [remoteStream]);
-
-  // Handle Socket Events & Window dispatch events
   useEffect(() => {
     const handleInitiateCall = async (e) => {
       const { targetUser } = e.detail;
@@ -57,8 +48,8 @@ const CallModal = () => {
       socket.on('answer', async (data) => {
         if (!peerConnection) return;
         await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        isRemoteDescriptionSet = true;
         
-        // Flush any ICE candidates that arrived before the answer
         while (pendingIceCandidates.length > 0) {
           try {
             await peerConnection.addIceCandidate(pendingIceCandidates.shift());
@@ -71,8 +62,8 @@ const CallModal = () => {
 
       socket.on('ice-candidate', async (data) => {
         const candidate = new RTCIceCandidate(data.candidate);
-        // If peer connection isn't ready, buffer it
-        if (!peerConnection || !peerConnection.remoteDescription) {
+        // Explicitly eliminate race conditions
+        if (!isRemoteDescriptionSet || !peerConnection) {
           pendingIceCandidates.push(candidate);
           return;
         }
@@ -106,6 +97,8 @@ const CallModal = () => {
   }, [dispatch]);
 
   const initWebRTC = async (targetUserId) => {
+    isRemoteDescriptionSet = false;
+    pendingIceCandidates = [];
     peerConnection = new RTCPeerConnection(configuration);
 
     peerConnection.onicecandidate = (event) => {
@@ -115,28 +108,34 @@ const CallModal = () => {
     };
 
     peerConnection.ontrack = (event) => {
-      dispatch(setRemoteStream(event.streams[0]));
+      if (remoteAudioRef.current) {
+        // Direct assignment outside reactivity guards
+        remoteAudioRef.current.srcObject = event.streams[0];
+      }
     };
 
-    // Get Local Audio
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      dispatch(setLocalStream(stream));
+      globalLocalStream = stream;
+      if (localAudioRef.current) {
+         localAudioRef.current.srcObject = stream;
+      }
       stream.getTracks().forEach((track) => {
         peerConnection.addTrack(track, stream);
       });
     } catch (err) {
-      console.error('Failed to get local audio stream', err);
+      console.error('Failed to get local audio stream. Check microphone permissions.', err);
+      // Fails gracefully without throwing, audio works one-way if user blocks mic!
     }
   };
 
   const startCall = async (targetUserId, targetProfile) => {
     await initWebRTC(targetUserId);
 
-    const offer = await peerConnection.createOffer();
+    // Hardcode audio receive requests to ensure streams are negotiated both ways!
+    const offer = await peerConnection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
     await peerConnection.setLocalDescription(offer);
 
-    // Save target info temporarily in case of hangup
     window.currentTargetUserId = targetUserId;
 
     socket.emit('offer', {
@@ -154,8 +153,8 @@ const CallModal = () => {
     window.currentTargetUserId = callerId;
 
     await peerConnection.setRemoteDescription(new RTCSessionDescription(incomingCall.sdp));
+    isRemoteDescriptionSet = true;
 
-    // Flush any ICE candidates that arrived while user was ringing
     while (pendingIceCandidates.length > 0) {
       try {
         await peerConnection.addIceCandidate(pendingIceCandidates.shift());
@@ -164,7 +163,7 @@ const CallModal = () => {
       }
     }
 
-    const answer = await peerConnection.createAnswer();
+    const answer = await peerConnection.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
     await peerConnection.setLocalDescription(answer);
 
     socket.emit('answer', {
@@ -195,10 +194,12 @@ const CallModal = () => {
       peerConnection.close();
       peerConnection = null;
     }
-    pendingIceCandidates = []; // Clear queue on hangup
-    // Stop all local media tracks
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
+    pendingIceCandidates = [];
+    isRemoteDescriptionSet = false;
+    
+    if (globalLocalStream) {
+      globalLocalStream.getTracks().forEach(track => track.stop());
+      globalLocalStream = null;
     }
     window.currentTargetUserId = null;
     dispatch(endCall());
