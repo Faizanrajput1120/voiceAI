@@ -1,67 +1,73 @@
-import React, { useEffect, useRef, useCallback } from 'react';
-import { useDispatch, useSelector } from 'react-redux';
+import React, { useEffect, useRef, useCallback } from "react";
+import { useDispatch, useSelector } from "react-redux";
 import {
   receiveIncomingCall,
   acceptCall,
   endCall,
   resetCallState,
-} from '../features/callSlice';
-import { socket } from '../socket';
+} from "../features/callSlice";
+import { socket } from "../socket";
 
-// ─── ICE / TURN Configuration ─────────────────────────────────────────────────
-// To test if TURN is working: change iceTransportPolicy to 'relay'
-// If audio works with 'relay' but not 'all', your TURN server is fine but NAT is blocking direct paths
+// ================= TURN/STUN CONFIG =================
 const RTC_CONFIG = {
-iceTransportPolicy: "relay",
   iceServers: [
     {
-      urls: "turn:187.77.9.39:3478",
+      urls: [
+        "stun:187.77.9.39:3478",
+        "turn:187.77.9.39:3478"
+      ],
       username: "myuser",
-      credential: "mypassword"
-    }
-  ]
+      credential: "mypassword",
+    },
+  ],
 };
 
 const CallModal = () => {
   const dispatch = useDispatch();
   const { user } = useSelector((state) => state.auth);
-  const { isCalling, incomingCall, callStatus } = useSelector((state) => state.call);
+  const { isCalling, incomingCall, callStatus } = useSelector(
+    (state) => state.call
+  );
 
-  // ─── ALL WebRTC state inside refs — NEVER touched by bundler/minifier ────────
-  const pcRef                    = useRef(null);   // RTCPeerConnection
-  const localStreamRef           = useRef(null);   // local MediaStream
-  const pendingCandidatesRef     = useRef([]);      // buffered ICE candidates
-  const remoteDescSetRef         = useRef(false);  // flag: remote desc applied?
-  const targetUserIdRef          = useRef(null);   // who we're calling
+  // ================= Refs =================
+  const pcRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const remoteStreamRef = useRef(null);
 
-  // ─── Audio element refs ────────────────────────────────────────────────────
-  const localAudioRef  = useRef(null);
+  const pendingCandidatesRef = useRef([]);
+  const remoteDescSetRef = useRef(false);
+  const targetUserIdRef = useRef(null);
+
+  const localAudioRef = useRef(null);
   const remoteAudioRef = useRef(null);
 
-  // ─── Flush buffered ICE candidates ────────────────────────────────────────
-  const flushPendingCandidates = useCallback(async () => {
+  // ================= ICE helper =================
+  const addIceCandidateSafe = async (candidate) => {
+    try {
+      await pcRef.current.addIceCandidate(candidate);
+      console.log("[ICE] candidate added");
+    } catch (e) {
+      console.warn("[ICE] failed:", e);
+    }
+  };
+
+  const flushCandidates = async () => {
     const pc = pcRef.current;
     if (!pc) return;
-    while (pendingCandidatesRef.current.length > 0) {
-      const candidate = pendingCandidatesRef.current.shift();
-      try {
-        await pc.addIceCandidate(candidate);
-        console.log('[ICE] Flushed buffered candidate.');
-      } catch (e) {
-        console.error('[ICE] Failed to flush candidate:', e);
-      }
-    }
-  }, []);
 
-  // ─── Full cleanup ─────────────────────────────────────────────────────────
+    console.log("[ICE] flushing:", pendingCandidatesRef.current.length);
+
+    while (pendingCandidatesRef.current.length) {
+      const c = pendingCandidatesRef.current.shift();
+      await addIceCandidateSafe(c);
+    }
+  };
+
+  // ================= Cleanup =================
   const cleanupCall = useCallback(() => {
-    console.log('[Call] Cleaning up call state.');
+    console.log("[Call] cleanup");
 
     if (pcRef.current) {
-      pcRef.current.onicecandidate       = null;
-      pcRef.current.ontrack              = null;
-      pcRef.current.oniceconnectionstatechange = null;
-      pcRef.current.onconnectionstatechange    = null;
       pcRef.current.close();
       pcRef.current = null;
     }
@@ -72,367 +78,227 @@ const CallModal = () => {
     }
 
     pendingCandidatesRef.current = [];
-    remoteDescSetRef.current     = false;
-    targetUserIdRef.current      = null;
+    remoteDescSetRef.current = false;
+    targetUserIdRef.current = null;
 
-    if (localAudioRef.current)  localAudioRef.current.srcObject  = null;
+    if (localAudioRef.current) localAudioRef.current.srcObject = null;
     if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
 
     dispatch(endCall());
     dispatch(resetCallState());
   }, [dispatch]);
 
-  // ─── Attach remote audio — called from ontrack ────────────────────────────
-  const attachRemoteAudio = useCallback((event) => {
-    console.log('[ontrack] kind:', event.track.kind, '| streams:', event.streams.length);
+  // ================= Remote Audio =================
+  const onTrack = (event) => {
+    console.log("[ontrack]", event.track.kind);
 
-    const el = remoteAudioRef.current;
-    if (!el) {
-      console.warn('[ontrack] remoteAudioRef not ready yet.');
-      return;
+    const stream = event.streams?.[0] || new MediaStream([event.track]);
+
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = stream;
+      remoteAudioRef.current.play().catch(() => {});
     }
 
-    const stream = (event.streams && event.streams[0])
-      ? event.streams[0]
-      : new MediaStream([event.track]);
+    remoteStreamRef.current = stream;
+  };
 
-    // Only reassign if it's a different stream
-    if (!el.srcObject || el.srcObject.id !== stream.id) {
-      el.srcObject = stream;
-      console.log('[Audio] Assigned remote stream:', stream.id);
-    }
-
-    // Ensure audio is not muted and volume is up
-    el.muted  = false;
-    el.volume = 1.0;
-
-    // playsInline is critical for iOS Safari
-    el.setAttribute('playsinline', '');
-
-    el.play().catch((err) => {
-      console.warn('[Audio] Autoplay blocked by browser:', err.message);
-      // Browser blocked autoplay — user needs to interact first.
-      // The audio will play on next user interaction automatically.
-    });
-  }, []);
-
-  // ─── Create RTCPeerConnection and acquire microphone ─────────────────────
+  // ================= INIT WEBRTC =================
   const initWebRTC = useCallback(async (targetUserId) => {
-    // Reset state for fresh connection
-    remoteDescSetRef.current     = false;
+    remoteDescSetRef.current = false;
     pendingCandidatesRef.current = [];
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcRef.current = pc;
 
-    // ── Connection state diagnostics ────────────────────────────────────────
+    // ===== ICE debug =====
     pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
-      console.log('[ICE] Connection state:', state);
-      if (state === 'failed' || state === 'disconnected') {
-        console.warn('[ICE] Failed/disconnected — ending call.');
+      console.log("[ICE]", pc.iceConnectionState);
+
+      if (
+        pc.iceConnectionState === "connected" ||
+        pc.iceConnectionState === "completed"
+      ) {
+        console.log("[ICE] CONNECTED ✅");
+      }
+
+      if (pc.iceConnectionState === "failed") {
+        console.warn("[ICE] FAILED ❌");
         cleanupCall();
       }
     };
 
     pc.onconnectionstatechange = () => {
-      console.log('[PC] Connection state:', pc.connectionState);
+      console.log("[PC]", pc.connectionState);
     };
 
-    pc.onsignalingstatechange = () => {
-      console.log('[PC] Signaling state:', pc.signalingState);
-    };
-
-    // ── Send ICE candidates to remote peer ──────────────────────────────────
+    // ===== ICE outgoing =====
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('[ICE] Sending:', event.candidate.type, event.candidate.protocol);
-        socket.emit('ice-candidate', {
+        socket.emit("ice-candidate", {
           targetUserId,
           candidate: event.candidate,
         });
-      } else {
-        console.log('[ICE] Gathering complete.');
       }
     };
 
-    // ── Handle incoming remote audio track ──────────────────────────────────
-    pc.ontrack = attachRemoteAudio;
+    pc.ontrack = onTrack;
 
-    // ── Acquire microphone ──────────────────────────────────────────────────
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 48000,
-        },
-        video: false,
-      });
-    } catch (err) {
-      console.error('[Mic] getUserMedia failed:', err.name, err.message);
-      alert(
-        err.name === 'NotAllowedError'
-          ? 'Microphone permission denied. Please allow mic access and try again.'
-          : 'Could not access microphone: ' + err.message
-      );
-      cleanupCall();
-      throw err; // Abort — do not create offer/answer without a stream
-    }
+    // ===== mic =====
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
 
     localStreamRef.current = stream;
-
     if (localAudioRef.current) {
       localAudioRef.current.srcObject = stream;
     }
 
-    // ── KEY FIX: addTransceiver with direction:'sendrecv' ───────────────────
-    // This is what guarantees BOTH sides send and receive audio.
-    // Using addTrack() alone can result in one side being sendonly.
+    // IMPORTANT FIX: use addTrack (NOT transceiver)
     stream.getAudioTracks().forEach((track) => {
-      const transceiver = pc.addTransceiver(track, {
-        direction: 'sendrecv',
-        streams: [stream],
-      });
-      console.log('[PC] Transceiver added. Direction:', transceiver.direction);
+      pc.addTrack(track, stream);
     });
 
-    console.log('[WebRTC] Initialized for target:', targetUserId);
-  }, [attachRemoteAudio, cleanupCall]);
+    console.log("[WebRTC] ready");
+  }, [cleanupCall]);
 
-  // ─── Socket event handlers ────────────────────────────────────────────────
+  // ================= SOCKET EVENTS =================
   useEffect(() => {
     if (!socket) return;
 
-    // ── Incoming call offer ─────────────────────────────────────────────────
-    const onOffer = (data) => {
-      console.log('[Socket] offer received from:', data.callerId);
+    socket.on("offer", (data) => {
       dispatch(receiveIncomingCall(data));
-    };
+    });
 
-    // ── Answer received (caller side) ───────────────────────────────────────
-    const onAnswer = async (data) => {
+    socket.on("answer", async (data) => {
       const pc = pcRef.current;
-      if (!pc) {
-        console.warn('[Socket] answer received but no peerConnection exists.');
-        return;
-      }
-      console.log('[Socket] answer received.');
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        remoteDescSetRef.current = true;
-        console.log('[SDP] Remote description (answer) set.');
-        await flushPendingCandidates();
-        dispatch(acceptCall());
-      } catch (e) {
-        console.error('[SDP] setRemoteDescription (answer) failed:', e);
-      }
-    };
+      if (!pc) return;
 
-    // ── ICE candidate from remote ───────────────────────────────────────────
-    const onIceCandidate = async (data) => {
-      if (!data || !data.candidate) return;
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(data.sdp)
+      );
+
+      remoteDescSetRef.current = true;
+      await flushCandidates();
+    });
+
+    socket.on("ice-candidate", async (data) => {
+      const pc = pcRef.current;
       const candidate = new RTCIceCandidate(data.candidate);
 
-      const pc = pcRef.current;
-      if (!pc || !remoteDescSetRef.current) {
-        console.log('[ICE] Buffering candidate — remote desc not set yet.');
+      if (!pc || !pc.remoteDescription) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
-      try {
-        await pc.addIceCandidate(candidate);
-        console.log('[ICE] Candidate added.');
-      } catch (e) {
-        console.error('[ICE] addIceCandidate failed:', e);
-      }
-    };
 
-    // ── Remote ended the call ───────────────────────────────────────────────
-    const onCallEnded = () => {
-      console.log('[Socket] call-ended received.');
-      cleanupCall();
-    };
+      await addIceCandidateSafe(candidate);
+    });
 
-    // ── Remote rejected the call ────────────────────────────────────────────
-    const onCallRejected = () => {
-      console.log('[Socket] call-rejected received.');
-      cleanupCall();
-      alert('Call was rejected.');
-    };
-
-    socket.on('offer',        onOffer);
-    socket.on('answer',       onAnswer);
-    socket.on('ice-candidate', onIceCandidate);
-    socket.on('call-ended',   onCallEnded);
-    socket.on('call-rejected', onCallRejected);
+    socket.on("call-ended", cleanupCall);
+    socket.on("call-reject", cleanupCall);
 
     return () => {
-      socket.off('offer',        onOffer);
-      socket.off('answer',       onAnswer);
-      socket.off('ice-candidate', onIceCandidate);
-      socket.off('call-ended',   onCallEnded);
-      socket.off('call-rejected', onCallRejected);
+      socket.off("offer");
+      socket.off("answer");
+      socket.off("ice-candidate");
+      socket.off("call-ended");
+      socket.off("call-reject");
     };
-  }, [dispatch, cleanupCall, flushPendingCandidates]);
+  }, [dispatch, cleanupCall]);
 
-  // ─── Listen for initiate-call custom events ───────────────────────────────
+  // ================= INITIATE CALL =================
   useEffect(() => {
-    const onInitiateCall = async (e) => {
-      const { targetUser } = e.detail;
-      try {
-        await initWebRTC(targetUser._id);
-        targetUserIdRef.current = targetUser._id;
+    const handler = async (e) => {
+      const targetUser = e.detail.targetUser;
 
-        const pc     = pcRef.current;
-        const offer  = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        console.log('[SDP] Offer set as local description.');
-        console.log('[SDP] Offer SDP (check for a=sendrecv):\n', offer.sdp);
-
-        socket.emit('offer', {
-          targetUserId:  targetUser._id,
-          callerId:      user._id,
-          sdp:           offer,
-          callerProfile: user,
-        });
-      } catch (err) {
-        console.error('[Call] startCall failed:', err);
-      }
-    };
-
-    window.addEventListener('initiate-call', onInitiateCall);
-    return () => window.removeEventListener('initiate-call', onInitiateCall);
-  }, [initWebRTC, user]);
-
-  // ─── Cleanup on unmount ───────────────────────────────────────────────────
-  useEffect(() => {
-    return () => cleanupCall();
-  }, [cleanupCall]);
-
-  // ─── Accept incoming call ─────────────────────────────────────────────────
-  const handleAcceptCall = useCallback(async () => {
-    if (!incomingCall) return;
-
-    const callerId = incomingCall.callerId;
-    targetUserIdRef.current = callerId;
-
-    try {
-      await initWebRTC(callerId);
+      await initWebRTC(targetUser._id);
+      targetUserIdRef.current = targetUser._id;
 
       const pc = pcRef.current;
 
-      await pc.setRemoteDescription(new RTCSessionDescription(incomingCall.sdp));
-      remoteDescSetRef.current = true;
-      console.log('[SDP] Remote description (offer) set.');
-      console.log('[SDP] Offer SDP (check for a=sendrecv):\n', incomingCall.sdp.sdp);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
 
-      await flushPendingCandidates();
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      console.log('[SDP] Answer set as local description.');
-      console.log('[SDP] Answer SDP (check for a=sendrecv):\n', answer.sdp);
-
-      socket.emit('answer', {
-        targetUserId: callerId,
-        sdp: answer,
+      socket.emit("offer", {
+        targetUserId: targetUser._id,
+        callerId: user._id,
+        sdp: offer,
       });
+    };
 
-      dispatch(acceptCall());
-    } catch (err) {
-      console.error('[Call] handleAcceptCall failed:', err);
-      cleanupCall();
-    }
-  }, [incomingCall, initWebRTC, flushPendingCandidates, cleanupCall, dispatch]);
+    window.addEventListener("initiate-call", handler);
+    return () => window.removeEventListener("initiate-call", handler);
+  }, [initWebRTC, user]);
 
-  // ─── Reject incoming call ─────────────────────────────────────────────────
-  const handleRejectCall = useCallback(() => {
-    if (incomingCall) {
-      socket.emit('call-reject', { targetUserId: incomingCall.callerId });
-    }
+  // ================= ACCEPT CALL =================
+  const handleAccept = async () => {
+    const callerId = incomingCall.callerId;
+
+    await initWebRTC(callerId);
+
+    const pc = pcRef.current;
+
+    await pc.setRemoteDescription(
+      new RTCSessionDescription(incomingCall.sdp)
+    );
+
+    remoteDescSetRef.current = true;
+
+    await flushCandidates();
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    socket.emit("answer", {
+      targetUserId: callerId,
+      sdp: answer,
+    });
+
+    dispatch(acceptCall());
+  };
+
+  // ================= REJECT =================
+  const handleReject = () => {
+    socket.emit("call-reject", {
+      targetUserId: incomingCall.callerId,
+    });
+
     cleanupCall();
-  }, [incomingCall, cleanupCall]);
+  };
 
-  // ─── Hang up ──────────────────────────────────────────────────────────────
-  const handleHangup = useCallback(() => {
-    const targetUserId = targetUserIdRef.current ?? incomingCall?.callerId ?? null;
-    if (targetUserId && socket) {
-      socket.emit('end-call', { targetUserId });
-    }
+  // ================= HANGUP =================
+  const handleHangup = () => {
+    const targetUserId =
+      targetUserIdRef.current || incomingCall?.callerId;
+
+    socket.emit("end-call", { targetUserId });
+
     cleanupCall();
-  }, [incomingCall, cleanupCall]);
+  };
 
-  // ─── Derived display values ───────────────────────────────────────────────
-  const displayName = incomingCall?.callerProfile?.username ?? 'Calling...';
-
-  // ─── Don't render when idle ───────────────────────────────────────────────
-  if (!isCalling && !incomingCall && callStatus === 'idle') return null;
+  // ================= UI =================
+  if (!isCalling && !incomingCall) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
-      <div className="card w-96 glass shadow-2xl bg-indigo-900/40 border border-white/20">
-        <div className="card-body text-center flex flex-col items-center">
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center">
+      <div className="bg-white p-6 rounded-xl w-96 text-center">
 
-          {/* ── Avatar ── */}
-          <div className={`avatar mb-6 relative ${callStatus === 'ringing' ? 'animate-pulse' : ''}`}>
-            <div className="w-24 rounded-full ring ring-primary ring-offset-base-100 ring-offset-2 overflow-hidden shadow-[0_0_20px_rgba(99,102,241,0.6)]">
-              <img
-                src={`https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=random`}
-                alt="caller avatar"
-              />
-            </div>
-            {callStatus === 'ringing' && (
-              <div className="absolute inset-0 rounded-full border-4 border-primary animate-ping opacity-50" />
-            )}
-          </div>
+        <h2 className="text-xl font-bold mb-4">
+          {incomingCall ? "Incoming Call" : "Calling..."}
+        </h2>
 
-          {/* ── Status ── */}
-          <h3 className="text-2xl font-bold text-white mb-2">
-            {incomingCall && callStatus === 'ringing' && `Incoming Call from ${displayName}`}
-            {isCalling    && callStatus === 'ringing' && 'Calling...'}
-            {callStatus === 'connected'               && 'Call Connected'}
-          </h3>
-          <p className="text-white/60 text-sm mb-8">
-            {callStatus === 'connected'
-              ? 'Secure WebRTC Peer Connection'
-              : 'Signaling via Socket.io'}
-          </p>
-
-          {/* ── Buttons ── */}
-          <div className="flex gap-6 w-full justify-center mt-4">
-            {callStatus === 'ringing' && incomingCall && (
-              <>
-                <button
-                  onClick={handleAcceptCall}
-                  className="btn btn-success btn-circle btn-lg text-white shadow-[0_0_15px_rgba(54,211,153,0.6)] hover:scale-110"
-                >
-                  Accept
-                </button>
-                <button
-                  onClick={handleRejectCall}
-                  className="btn btn-error btn-circle btn-lg text-white shadow-[0_0_15px_rgba(248,114,114,0.6)] hover:scale-110"
-                >
-                  Reject
-                </button>
-              </>
-            )}
-            <button
-              onClick={handleHangup}
-              className="btn btn-error btn-circle btn-lg text-white shadow-[0_0_15px_rgba(248,114,114,0.6)] hover:scale-110"
-            >
-              Hangup
-            </button>
-          </div>
+        <div className="flex justify-center gap-4">
+          {incomingCall && (
+            <>
+              <button onClick={handleAccept}>Accept</button>
+              <button onClick={handleReject}>Reject</button>
+            </>
+          )}
+          <button onClick={handleHangup}>Hangup</button>
         </div>
 
-        {/* ── Audio elements — hidden but functional ── */}
-        <audio ref={localAudioRef}  autoPlay muted      playsInline />
-        <audio ref={remoteAudioRef} autoPlay playsInline />
+        <audio ref={localAudioRef} muted autoPlay />
+        <audio ref={remoteAudioRef} autoPlay />
       </div>
     </div>
   );
