@@ -5,10 +5,18 @@ import { socket } from '../socket'; // <-- Updated import
 
 // Global WebRTC connection object
 let peerConnection;
+let pendingIceCandidates = []; // Queue for buffering ICE candidates
 
 const configuration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    {
+      urls: 'turn:187.77.9.39:3478',
+      username: 'myuser',
+      credential: 'mypassword'
+    }
   ],
 };
 
@@ -49,13 +57,27 @@ const CallModal = () => {
       socket.on('answer', async (data) => {
         if (!peerConnection) return;
         await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        
+        // Flush any ICE candidates that arrived before the answer
+        while (pendingIceCandidates.length > 0) {
+          try {
+            await peerConnection.addIceCandidate(pendingIceCandidates.shift());
+          } catch (e) {
+            console.error('Failed to add buffered candidate on answer:', e);
+          }
+        }
         dispatch(acceptCall());
       });
 
       socket.on('ice-candidate', async (data) => {
-        if (!peerConnection) return;
+        const candidate = new RTCIceCandidate(data.candidate);
+        // If peer connection isn't ready, buffer it
+        if (!peerConnection || !peerConnection.remoteDescription) {
+          pendingIceCandidates.push(candidate);
+          return;
+        }
         try {
-          await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+          await peerConnection.addIceCandidate(candidate);
         } catch (e) {
           console.error('Error adding received ice candidate', e);
         }
@@ -132,6 +154,16 @@ const CallModal = () => {
     window.currentTargetUserId = callerId;
 
     await peerConnection.setRemoteDescription(new RTCSessionDescription(incomingCall.sdp));
+
+    // Flush any ICE candidates that arrived while user was ringing
+    while (pendingIceCandidates.length > 0) {
+      try {
+        await peerConnection.addIceCandidate(pendingIceCandidates.shift());
+      } catch (e) {
+        console.error('Failed to add buffered candidate on accept:', e);
+      }
+    }
+
     const answer = await peerConnection.createAnswer();
     await peerConnection.setLocalDescription(answer);
 
@@ -163,6 +195,7 @@ const CallModal = () => {
       peerConnection.close();
       peerConnection = null;
     }
+    pendingIceCandidates = []; // Clear queue on hangup
     // Stop all local media tracks
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
