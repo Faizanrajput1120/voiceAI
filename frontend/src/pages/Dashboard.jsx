@@ -14,7 +14,7 @@ const Dashboard = () => {
   const dispatch = useDispatch();
 
   useEffect(() => {
-    socket = io('http://localhost:6050');
+    socket = io('https://api.talkify.app');
 
     socket.on('connect', () => {
       console.log('Connected to socket server');

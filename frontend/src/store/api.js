@@ -3,7 +3,7 @@ import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
 export const api = createApi({
   reducerPath: 'api',
   baseQuery: fetchBaseQuery({
-    baseUrl: 'http://localhost:6050/api', // Update if necessary
+    baseUrl: 'https://api.talkify.app/api', // Update if necessary
     prepareHeaders: (headers, { getState }) => {
       const token = getState().auth.token;
       if (token) {
