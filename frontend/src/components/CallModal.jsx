@@ -10,19 +10,18 @@ let isRemoteDescriptionSet = false;
 let globalLocalStream = null;
 
 const configuration = {
+  iceTransportPolicy: "all",
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: "stun:stun.l.google.com:19302" },
     {
       urls: [
-        'turn:187.77.9.39:3478?transport=udp',
-        'turn:187.77.9.39:3478?transport=tcp' // Extremely important fallback for deep NATs
+        "turn:187.77.9.39:3478?transport=udp",
+        "turn:187.77.9.39:3478?transport=tcp"
       ],
-      username: 'myuser',
-      credential: 'mypassword'
+      username: "myuser",
+      credential: "mypassword"
     }
-  ],
+  ]
 };
 
 const CallModal = () => {
