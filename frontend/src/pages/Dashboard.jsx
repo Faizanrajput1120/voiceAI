@@ -3,10 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { useGetUsersQuery } from '../store/api';
 import { logout } from '../features/authSlice';
 import { startCalling } from '../features/callSlice';
-import { io } from 'socket.io-client';
-
-// Global socket variable so we can access it elsewhere (or pass it via context/redux)
-export let socket;
+import { socket } from '../socket';
 
 const Dashboard = () => {
   const { user, token } = useSelector((state) => state.auth);
@@ -14,7 +11,8 @@ const Dashboard = () => {
   const dispatch = useDispatch();
 
   useEffect(() => {
-    socket = io('https://api.talkify.app');
+    // Connect to the global socket
+    socket.connect();
 
     socket.on('connect', () => {
       console.log('Connected to socket server');

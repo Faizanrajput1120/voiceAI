@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { receiveIncomingCall, acceptCall, endCall, resetCallState, setLocalStream, setRemoteStream } from '../features/callSlice';
-import { socket } from '../pages/Dashboard';
+import { socket } from '../socket'; // <-- Updated import
 
 // Global WebRTC connection object
 let peerConnection;
