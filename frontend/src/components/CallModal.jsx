@@ -101,6 +101,10 @@ const CallModal = () => {
     pendingIceCandidates = [];
     peerConnection = new RTCPeerConnection(configuration);
 
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log('ICE Connection State:', peerConnection.iceConnectionState);
+    };
+
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socket) {
         socket.emit('ice-candidate', { targetUserId, candidate: event.candidate });
@@ -109,8 +113,12 @@ const CallModal = () => {
 
     peerConnection.ontrack = (event) => {
       if (remoteAudioRef.current) {
-        // Direct assignment outside reactivity guards
-        remoteAudioRef.current.srcObject = event.streams[0];
+        // Fallback for browsers that don't package event.streams correctly
+        const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+        remoteAudioRef.current.srcObject = stream;
+        
+        // Force explicitly play to bypass strict browser Autoplay policies (crucial for one-way audio fixes in Safari/iOS)
+        remoteAudioRef.current.play().catch(e => console.error("Audio autoplay was prevented:", e));
       }
     };
 
@@ -125,7 +133,6 @@ const CallModal = () => {
       });
     } catch (err) {
       console.error('Failed to get local audio stream. Check microphone permissions.', err);
-      // Fails gracefully without throwing, audio works one-way if user blocks mic!
     }
   };
 
