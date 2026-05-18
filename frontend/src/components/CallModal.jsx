@@ -12,19 +12,14 @@ import { socket } from '../socket';
 // To test if TURN is working: change iceTransportPolicy to 'relay'
 // If audio works with 'relay' but not 'all', your TURN server is fine but NAT is blocking direct paths
 const RTC_CONFIG = {
-  iceTransportPolicy: 'all',
+iceTransportPolicy: "relay",
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
     {
-      urls: [
-        'turn:187.77.9.39:3478?transport=udp',
-        'turn:187.77.9.39:3478?transport=tcp',
-      ],
-      username: 'myuser',
-      credential: 'mypassword',
-    },
-  ],
+      urls: "turn:187.77.9.39:3478",
+      username: "myuser",
+      credential: "mypassword"
+    }
+  ]
 };
 
 const CallModal = () => {
