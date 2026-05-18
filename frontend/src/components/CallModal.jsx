@@ -8,159 +8,148 @@ import {
 } from "../features/callSlice";
 import { socket } from "../socket";
 
-// ================= TURN/STUN CONFIG =================
+// ================= TURN + STUN (PRODUCTION STYLE) =================
 const RTC_CONFIG = {
   iceServers: [
+    { urls: ["stun:stun.l.google.com:19302"] },
     {
       urls: [
-        "stun:187.77.9.39:3478",
-        "turn:187.77.9.39:3478"
+        "turn:187.77.9.39:3478?transport=udp",
+        "turn:187.77.9.39:3478?transport=tcp",
       ],
       username: "myuser",
       credential: "mypassword",
     },
   ],
+  iceCandidatePoolSize: 10,
 };
 
-const CallModal = () => {
+export default function CallModal() {
   const dispatch = useDispatch();
-  const { user } = useSelector((state) => state.auth);
-  const { isCalling, incomingCall, callStatus } = useSelector(
-    (state) => state.call
-  );
+  const { user } = useSelector((s) => s.auth);
+  const { incomingCall, isCalling, callStatus } = useSelector((s) => s.call);
 
-  // ================= Refs =================
+  // ================= CORE REFS =================
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
   const remoteStreamRef = useRef(null);
 
-  const pendingCandidatesRef = useRef([]);
-  const remoteDescSetRef = useRef(false);
-  const targetUserIdRef = useRef(null);
+  const pendingIce = useRef([]);
+  const remoteDescSet = useRef(false);
+  const targetId = useRef(null);
 
   const localAudioRef = useRef(null);
   const remoteAudioRef = useRef(null);
 
-  // ================= ICE helper =================
-  const addIceCandidateSafe = async (candidate) => {
-    try {
-      await pcRef.current.addIceCandidate(candidate);
-      console.log("[ICE] candidate added");
-    } catch (e) {
-      console.warn("[ICE] failed:", e);
-    }
-  };
-
-  const flushCandidates = async () => {
-    const pc = pcRef.current;
-    if (!pc) return;
-
-    console.log("[ICE] flushing:", pendingCandidatesRef.current.length);
-
-    while (pendingCandidatesRef.current.length) {
-      const c = pendingCandidatesRef.current.shift();
-      await addIceCandidateSafe(c);
-    }
-  };
-
-  // ================= Cleanup =================
-  const cleanupCall = useCallback(() => {
-    console.log("[Call] cleanup");
+  // ================= CLEANUP =================
+  const cleanup = useCallback(() => {
+    console.log("[CALL] cleanup");
 
     if (pcRef.current) {
+      pcRef.current.ontrack = null;
+      pcRef.current.onicecandidate = null;
       pcRef.current.close();
       pcRef.current = null;
     }
 
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
     }
 
-    pendingCandidatesRef.current = [];
-    remoteDescSetRef.current = false;
-    targetUserIdRef.current = null;
-
-    if (localAudioRef.current) localAudioRef.current.srcObject = null;
-    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    pendingIce.current = [];
+    remoteDescSet.current = false;
+    targetId.current = null;
 
     dispatch(endCall());
     dispatch(resetCallState());
   }, [dispatch]);
 
-  // ================= Remote Audio =================
-  const onTrack = (event) => {
-    console.log("[ontrack]", event.track.kind);
-
-    const stream = event.streams?.[0] || new MediaStream([event.track]);
-
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.srcObject = stream;
-      remoteAudioRef.current.play().catch(() => {});
+  // ================= ADD ICE =================
+  const addIce = async (candidate) => {
+    try {
+      await pcRef.current.addIceCandidate(candidate);
+    } catch (e) {
+      console.warn("[ICE FAIL]", e);
     }
-
-    remoteStreamRef.current = stream;
   };
 
-  // ================= INIT WEBRTC =================
-  const initWebRTC = useCallback(async (targetUserId) => {
-    remoteDescSetRef.current = false;
-    pendingCandidatesRef.current = [];
+  const flushIce = async () => {
+    while (pendingIce.current.length) {
+      await addIce(pendingIce.current.shift());
+    }
+  };
 
+  // ================= AUDIO FIX =================
+  const handleTrack = (event) => {
+    const stream = event.streams?.[0] || new MediaStream([event.track]);
+
+    remoteAudioRef.current.srcObject = stream;
+    remoteAudioRef.current.autoplay = true;
+    remoteAudioRef.current.playsInline = true;
+    remoteAudioRef.current.muted = false;
+    remoteAudioRef.current.volume = 1;
+
+    const play = () => {
+      remoteAudioRef.current.play().catch(() => {});
+    };
+
+    play();
+    document.addEventListener("click", play, { once: true });
+  };
+
+  // ================= INIT PEER =================
+  const createPeer = useCallback(async (id) => {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcRef.current = pc;
 
-    // ===== ICE debug =====
+    remoteDescSet.current = false;
+    pendingIce.current = [];
+
+    // ICE state
     pc.oniceconnectionstatechange = () => {
       console.log("[ICE]", pc.iceConnectionState);
 
-      if (
-        pc.iceConnectionState === "connected" ||
-        pc.iceConnectionState === "completed"
-      ) {
-        console.log("[ICE] CONNECTED ✅");
-      }
-
       if (pc.iceConnectionState === "failed") {
-        console.warn("[ICE] FAILED ❌");
-        cleanupCall();
+        console.warn("[CALL FAILED]");
+        cleanup();
       }
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log("[PC]", pc.connectionState);
-    };
+    // remote track
+    pc.ontrack = handleTrack;
 
-    // ===== ICE outgoing =====
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
+    // send ICE
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
         socket.emit("ice-candidate", {
-          targetUserId,
-          candidate: event.candidate,
+          targetUserId: id,
+          candidate: e.candidate,
         });
       }
     };
 
-    pc.ontrack = onTrack;
-
-    // ===== mic =====
+    // ================= MIC =================
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
       video: false,
     });
 
     localStreamRef.current = stream;
-    if (localAudioRef.current) {
-      localAudioRef.current.srcObject = stream;
-    }
+    localAudioRef.current.srcObject = stream;
 
-    // IMPORTANT FIX: use addTrack (NOT transceiver)
+    // IMPORTANT: stable audio pipeline
     stream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
       pc.addTrack(track, stream);
     });
 
-    console.log("[WebRTC] ready");
-  }, [cleanupCall]);
+    console.log("[WEBRTC] peer ready");
+  }, [cleanup]);
 
   // ================= SOCKET EVENTS =================
   useEffect(() => {
@@ -174,28 +163,25 @@ const CallModal = () => {
       const pc = pcRef.current;
       if (!pc) return;
 
-      await pc.setRemoteDescription(
-        new RTCSessionDescription(data.sdp)
-      );
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      remoteDescSet.current = true;
 
-      remoteDescSetRef.current = true;
-      await flushCandidates();
+      await flushIce();
     });
 
     socket.on("ice-candidate", async (data) => {
-      const pc = pcRef.current;
       const candidate = new RTCIceCandidate(data.candidate);
 
-      if (!pc || !pc.remoteDescription) {
-        pendingCandidatesRef.current.push(candidate);
+      if (!pcRef.current || !pcRef.current.remoteDescription) {
+        pendingIce.current.push(candidate);
         return;
       }
 
-      await addIceCandidateSafe(candidate);
+      await addIce(candidate);
     });
 
-    socket.on("call-ended", cleanupCall);
-    socket.on("call-reject", cleanupCall);
+    socket.on("call-ended", cleanup);
+    socket.on("call-reject", cleanup);
 
     return () => {
       socket.off("offer");
@@ -204,15 +190,15 @@ const CallModal = () => {
       socket.off("call-ended");
       socket.off("call-reject");
     };
-  }, [dispatch, cleanupCall]);
+  }, [dispatch, cleanup]);
 
-  // ================= INITIATE CALL =================
+  // ================= START CALL =================
   useEffect(() => {
     const handler = async (e) => {
-      const targetUser = e.detail.targetUser;
+      const id = e.detail.targetUser._id;
 
-      await initWebRTC(targetUser._id);
-      targetUserIdRef.current = targetUser._id;
+      await createPeer(id);
+      targetId.current = id;
 
       const pc = pcRef.current;
 
@@ -220,7 +206,7 @@ const CallModal = () => {
       await pc.setLocalDescription(offer);
 
       socket.emit("offer", {
-        targetUserId: targetUser._id,
+        targetUserId: id,
         callerId: user._id,
         sdp: offer,
       });
@@ -228,13 +214,13 @@ const CallModal = () => {
 
     window.addEventListener("initiate-call", handler);
     return () => window.removeEventListener("initiate-call", handler);
-  }, [initWebRTC, user]);
+  }, [createPeer, user]);
 
   // ================= ACCEPT CALL =================
-  const handleAccept = async () => {
+  const acceptCallHandler = async () => {
     const callerId = incomingCall.callerId;
 
-    await initWebRTC(callerId);
+    await createPeer(callerId);
 
     const pc = pcRef.current;
 
@@ -242,9 +228,8 @@ const CallModal = () => {
       new RTCSessionDescription(incomingCall.sdp)
     );
 
-    remoteDescSetRef.current = true;
-
-    await flushCandidates();
+    remoteDescSet.current = true;
+    await flushIce();
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -258,50 +243,45 @@ const CallModal = () => {
   };
 
   // ================= REJECT =================
-  const handleReject = () => {
+  const rejectCallHandler = () => {
     socket.emit("call-reject", {
       targetUserId: incomingCall.callerId,
     });
-
-    cleanupCall();
+    cleanup();
   };
 
   // ================= HANGUP =================
-  const handleHangup = () => {
-    const targetUserId =
-      targetUserIdRef.current || incomingCall?.callerId;
-
-    socket.emit("end-call", { targetUserId });
-
-    cleanupCall();
+  const hangup = () => {
+    socket.emit("end-call", {
+      targetUserId: targetId.current || incomingCall?.callerId,
+    });
+    cleanup();
   };
 
   // ================= UI =================
   if (!isCalling && !incomingCall) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center">
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center">
       <div className="bg-white p-6 rounded-xl w-96 text-center">
 
         <h2 className="text-xl font-bold mb-4">
           {incomingCall ? "Incoming Call" : "Calling..."}
         </h2>
 
-        <div className="flex justify-center gap-4">
-          {incomingCall && (
-            <>
-              <button onClick={handleAccept}>Accept</button>
-              <button onClick={handleReject}>Reject</button>
-            </>
-          )}
-          <button onClick={handleHangup}>Hangup</button>
-        </div>
+        {incomingCall && (
+          <div className="flex gap-3 justify-center mb-4">
+            <button onClick={acceptCallHandler}>Accept</button>
+            <button onClick={rejectCallHandler}>Reject</button>
+          </div>
+        )}
 
+        <button onClick={hangup}>Hangup</button>
+
+        {/* AUDIO ELEMENTS */}
         <audio ref={localAudioRef} muted autoPlay />
         <audio ref={remoteAudioRef} autoPlay />
       </div>
     </div>
   );
-};
-
-export default CallModal;
+}
